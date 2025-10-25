@@ -3,7 +3,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
-from constants import e, k, m_i, mu, A_probe, r_p, l_p, k_eV, K_to_eV
+from scipy.signal import savgol_filter
+from constants import e, k, m_i, mu, A_probe, r_p, l_p, k_eV, K_to_eV, m_e
 
 def read_keithley_csv(path):
     """
@@ -33,7 +34,7 @@ def read_keithley_csv(path):
     df = df.dropna(subset=keep).sort_values("SMU-1 Voltage (V)").reset_index(drop=True)
     return df
 
-def fit_data_to_polynomial(path):
+def fit_data_to_polynomial(path, degree=11):
     """
         Fits the data to a polynomial and returns the coefficients and the model
         Args:
@@ -49,7 +50,7 @@ def fit_data_to_polynomial(path):
     V = df['SMU-1 Voltage (V)'].round(6) 
     I = df['SMU-1 Current (A)']
 
-    coeffs = np.polyfit(V, I, deg=11)
+    coeffs = np.polyfit(V, I, deg=degree)
     model = np.poly1d(coeffs)
 
     return I, V, coeffs, model
@@ -91,6 +92,7 @@ def Vplasma_from_model(model: np.poly1d, V, n=4000, trim=0.05):
     cand = np.unique(np.concatenate([cand, [vmin, vmax]]))
 
     # evaluate p'' on the candidates and pick the minimum
+    cand = cand[cand > 0]
     d2I_vals = d2I(cand)
     idx = int(np.argmin(d2I_vals))
     v_star = float(cand[idx])
@@ -173,7 +175,6 @@ def find_Te_fit(I_e, V, V_plasma):
     T_e = e/(k*p[0]) #in K
     return T_e
 
-
 def find_Te_n_e_iteration(path):
     """
         Finds the electron temperature and electron density from the I_e and V data using an iterative method (Laframboise method).
@@ -212,14 +213,21 @@ def find_Te_n_e_iteration(path):
         I_e = I - I_ion 
         ## Prepare I_e to not have negatives or zeros:
         I_e = np.where(I_e <= 0, 1e-7, I_e)
-        T_e = find_Te_fit(I_e, V, V_plasma)
-        T_e_eV = T_e*K_to_eV #in eV
+        
         
         if i == 0:
+            #print("V_plasma is ", V_plasma)
+            #print("V_floating is ", V_floating)
+            T_e = e*(abs(V_plasma) - V_floating)/(k*(3.34 + 0.5*np.log(mu)))
+            #print("T_E at iteration 0 is in K ", T_e)
+            T_e_eV = T_e*K_to_eV #in eV
+            #print("T_E at iteration 0 is in eV ", T_e_eV)
             n_e = 1.05e15*np.sqrt(mu/T_e_eV)*I_e[200]/(A_probe)
         else:
             #print("n_e at iteration ", i, " is ", n_e)
             #print("I_e at iteration ", i, " is ", I_e[200])
+            T_e = find_Te_fit(I_e, V, V_plasma)
+            T_e_eV = T_e*K_to_eV #in eV
             n_e = 1.05e15*np.sqrt(mu/T_e_eV)*I_e[200]/(A_probe*j_i_star) # TODO: Check if this is correct
      
         #print("Te at iteration ", i, " is ", T_e)
@@ -227,7 +235,7 @@ def find_Te_n_e_iteration(path):
             break
         
         T_e_prev = T_e
-        
+
         # Calculate ratio:
         lambda_D = 7430*np.sqrt(T_e_eV/n_e)
         ratio = (r_p/lambda_D) #TODO Temporal fix is to take the mean of the ratios
@@ -298,7 +306,7 @@ def get_Te_ne_matrix_vs_position():
             positions: list of positions
     """
     parent_dir= "/Users/marisolvelapatino/Desktop/Langmuir-Probe/LP"
-    positions = [2,4,6]
+    positions = [0,2,4,6]
     pressures = [40,100]
     powers = [400, 600, 800, 1000]
     
@@ -339,7 +347,6 @@ def get_Te_ne_matrix_vs_position():
         ne_std_matrix_list.append(ne_std_matrix)
 
     return Te_matrix_list, ne_matrix_list, Te_std_matrix_list, ne_std_matrix_list, positions
-
 
 def plot_Te_ne_vs_pressure(plot_name, p_name, pressures, powers, matrix, std_matrix, location=None):
     """
@@ -414,3 +421,274 @@ def plot_Te_ne_vs_pressure(plot_name, p_name, pressures, powers, matrix, std_mat
     plt.show()
 
 
+# -------------------------------- EEDF CODE --------------------------------
+# ---------- distributions ----------
+def maxwellian_pdf_per_particle(E_eV: np.ndarray, Te_eV: float) -> np.ndarray:
+    """
+    Per-particle Maxwellian energy PDF (integrates to 1) in units 1/eV.
+    """
+    E = np.clip(np.asarray(E_eV, float), 0, None)
+    Te = float(Te_eV)
+    return (2/np.sqrt(np.pi)) * (np.sqrt(E) / (Te**1.5)) * np.exp(-E/Te)
+
+
+def eedf_data_per_particle(
+    VminusVp: np.ndarray,
+    I_e: np.ndarray,
+    ne_m3: float,
+    A_probe_m2: float,
+    smooth_span_V: float = 5.0,
+    polyorder: int = 3
+):
+    """
+    EEDF with the exact SI prefactor, then convert to per-particle 1/eV.
+
+    Inputs
+    ------
+    VminusVp : array of (V - Vp) [V]
+    I_e      : electron current [A]
+    ne_m3    : electron density [m^-3]
+    A_probe_m2 : probe area [m^2]
+    smooth_span_V : Savitzky-Golay span in Volts for derivatives
+    polyorder : Savitzky-Golay polynomial order
+
+    Returns
+    -------
+    E_eV_sorted : energy axis (eV), ascending
+    p_eV_sorted : per-particle EEDF (1/eV)
+    f_eV_sorted : absolute EEDF (m^-3 / eV)
+    d2I_sorted  : second derivative (A/V^2) on retarding region
+    """
+    VminusVp = np.asarray(VminusVp, float)
+    I_e = np.asarray(I_e, float)
+
+    # Retarding region (V <= Vp) -> V - Vp <= 0  and E = Vp - V >= 0
+    m = VminusVp <= 0
+    x = VminusVp[m]
+    I = I_e[m]
+
+    # Step size and SG window (odd length)
+    dV = float(np.median(np.diff(x)))
+    
+    win = max(7, int(round(smooth_span_V / max(abs(dV), 1e-12))) | 1)
+
+    # Stable second derivative (A / V^2)
+    print(win)
+    print(len(I))
+    d2I = savgol_filter(I, window_length=win, polyorder=polyorder,
+                        deriv=2, delta=dV, mode='interp')
+
+    # Energy in eV and J
+    E_eV = -(x)                              # E = Vp - V  (eV numerically)
+    E_J  = e * np.clip(E_eV, 0, None)        # Joules
+
+    # Druyvesteyn (SI): f_J [m^-3 J^-1]
+    pref_SI = -4.0 / (A_probe_m2 * e**2) * np.sqrt(m_e / (2.0 * e))
+    f_J = pref_SI * np.sqrt(E_J) * d2I
+
+    # Convert to m^-3/eV and then per-particle 1/eV
+    f_eV = f_J / e           # m^-3 / eV
+    p_eV = f_eV / ne_m3      # 1 / eV
+
+    # Sort for plotting/integration
+    order = np.argsort(E_eV)
+    return E_eV[order], p_eV[order], f_eV[order], d2I[order]
+
+def calibrate_eedf_to_density(E_eV: np.ndarray, f_eV: np.ndarray, ne_m3: float):
+    """
+    Enforce integral of f_eV dE = n_e by a single scale factor (useful if A_probe/baseline
+    makes the raw integral drift). Returns scaled f_eV and factor c.
+    """
+    area = float(np.trapezoid(np.clip(f_eV, 0, None), E_eV))
+    c = ne_m3 / area if area != 0 else 1.0
+    return f_eV * c, c
+
+
+# ---------- one-file plotting ----------
+def plot_eedf_vs_maxwellian(
+    I_e, V, V_plasma,
+    Te_K: float,
+    ne_m3: float,
+    A_probe_m2: float,
+    smooth_span_V: float = 5.0,
+    polyorder: int = 3,
+    calibrate_to_ne: bool = True,
+    figsize=(7,4.5)
+):
+    """
+    Make the plot shown: per-particle EEDF (1/eV) via Druyvesteyn (SI prefactor),
+    optionally calibrated to satisfy integral of f_eV dE = n_e, plus Maxwellian per-particle PDF.
+    """
+    VminusVp = (V-V_plasma).to_numpy()
+    Ie = I_e
+
+    # eedf (SI) -> per-particle EEDF
+    E_eV, p_eV, f_eV, _ = eedf_data_per_particle(
+        VminusVp, Ie, ne_m3, A_probe_m2, smooth_span_V, polyorder
+    )
+
+    # Optional calibration to enforce integral of f_eV dE = n_e (absolute scaling)
+    if calibrate_to_ne:
+        f_eV_cal, c = calibrate_eedf_to_density(E_eV, f_eV, ne_m3)
+        p_eV = f_eV_cal / ne_m3
+
+    # Maxwellian (per particle)
+    Te_eV = Te_K * k_eV
+    pM = maxwellian_pdf_per_particle(E_eV, Te_eV)
+
+    # Plot
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(E_eV, np.clip(p_eV, 0, None), label='EEDF per particle (1/eV)', lw=2)
+    ax.plot(E_eV, pM, '--', label=f'Maxwellian (Te={Te_eV:.2f} eV)', lw=2)
+    ax.set_xlabel('Energy  E = Vp - V  (eV)')
+    ax.set_ylabel('Per-particle density (1/eV)')
+    ax.grid(True)
+    ax.legend()
+    plt.tight_layout()
+    return fig, ax
+
+
+# --- Multi-trace aggregator ---
+def aggregate_three_traces(traces, files, A_probe_m2,
+                           smooth_span_V=5.0, polyorder=3, Ndatapoints=923, calibrate_to_ne=True):
+    """
+    traces: e.g., [1,2,3]
+    file : list of 3 files
+    A_probe_m2: probe area in m^2
+    Returns:
+      dict with means/stds for Te_K, ne, I_e, V, Vp,
+      and (E_common, p_mean, p_std, f_abs_mean) for the EEDF.
+    """
+    VminusVp_matrix= np.zeros((1001, len(traces)))
+    E_matrix= []
+    p_matrix= []
+    f_matrix= []
+    TeK_list, ne_list = [], []
+    
+
+    for i,trace in enumerate(traces):
+        file = files[i]
+
+        # --- use your EXISTING functions (unchanged) ---
+        Te_K, ne, I_e = find_Te_n_e_iteration(file)             # Te in K, ne in m^-3, I_e array
+        I, V, coeffs, model = fit_data_to_polynomial(file)
+        Vp, Iplasma, min_d2I, info = Vplasma_from_model(model, V)
+
+    
+        TeK_list.append(float(Te_K))
+        ne_list.append(float(ne))
+        VminusVp = (V-Vp).to_numpy()
+        VminusVp_matrix[:,i] = VminusVp
+        
+        # per-trace EEDF with SI prefactor
+        E_eV, p_eV, f_eV, _ = eedf_data_per_particle(
+            VminusVp, I_e, ne, A_probe_m2,
+            smooth_span_V=smooth_span_V, polyorder=polyorder
+        )
+        
+        #calibrate to ne
+        if calibrate_to_ne:
+            print("calibrating to ne")
+            f_eV_cal, c = calibrate_eedf_to_density(E_eV, f_eV, ne)
+            p_eV = f_eV_cal / ne
+
+        print(f"p_eV, {i+1} trace:\n {p_eV}")
+        E_matrix.append(E_eV)
+        p_matrix.append(p_eV)
+        f_matrix.append(f_eV)
+
+    
+    TeK_mean = float(np.mean(TeK_list))
+    TeK_std  = float(np.std (TeK_list, ddof=1)) if len(TeK_list)>1 else 0.0
+    ne_mean  = float(np.mean(ne_list))
+    ne_std   = float(np.std (ne_list, ddof=1)) if len(ne_list)>1 else 0.0
+
+    # --- common energy grid (use overlap of the three traces) ---
+    
+    Emin = max(E.min() for E in E_matrix)
+    Emax = min(E.max() for E in E_matrix)
+    E_common = np.linspace(Emin, Emax, Ndatapoints)
+
+    # interpolate per-trace EEDF onto common grid and aggregate
+    p_interp = np.vstack([np.interp(E_common, E, p, left=0, right=0) for E,p in zip(E_matrix, p_matrix)])
+    print("Shape of p_interp: ", p_interp.shape)
+    f_interp = np.vstack([np.interp(E_common, E, f, left=0.0, right=0.0) for E,f in zip(E_matrix, f_matrix)])
+
+    p_mean = np.mean(p_interp, axis=0)
+    p_mean = np.clip(p_mean, 0, None)
+    
+    # E_common is uniform (linspace), so this is perfect
+    dE = E_common[1] - E_common[0]
+
+    def smooth_savgol(y, span_eV=5.0, polyorder=3):
+        # convert a desired energy span into an odd window length in points
+        w = max(3, int(round(span_eV / dE)) | 1)           # odd int >= 3
+        w = max(w, polyorder + 2 | 1)                      # ensure > polyorder
+        ys = savgol_filter(y, window_length=w, polyorder=polyorder, mode="interp")
+        return np.clip(ys, 0, None)                        # keep nonnegative
+
+    p_mean_smooth = smooth_savgol(p_mean, span_eV=5.0, polyorder=3)
+
+    p_std  = np.std(p_mean_smooth, axis=0, ddof=1) / np.sqrt(len(traces)) 
+
+
+    bundle_data = {
+        "E_common": E_common,
+        "p_mean": p_mean_smooth,          # 1/eV
+        "p_std": p_std,            # 1/eV
+        "TeK_mean": TeK_mean, "TeK_std": TeK_std,
+        "ne_mean": ne_mean, "ne_std": ne_std,
+    }
+    
+    return bundle_data
+    
+# --- plotting helper (mean ±1σ + Maxwellian from mean Te) ---
+def plot_eedf_bundle(bundle, title=None):
+    E = bundle["E_common"]
+    p = bundle["p_mean"]
+    s = bundle["p_std"]
+
+    Te_eV = bundle["TeK_mean"] * k_eV
+    pM = maxwellian_pdf_per_particle(E, Te_eV)
+
+    
+    (line,) = plt.plot(E, p, label=f"EEDF mean (1/eV) for {title}", lw=2)
+    plt.fill_between(E, np.clip(p-s,0,None), p+s, alpha=0.25, label=f"±1 sigma for {title}")
+    c = line.get_color()
+    plt.plot(E, pM, "--", lw=2, color= c, label=f"Maxwellian (Te={Te_eV:.2f} eV) for {title}")
+    
+    plt.xlabel("Energy  E = Vp - V  (eV)")
+    plt.ylabel("Per-particle density (1/eV)")
+    plt.grid(True); plt.legend(); plt.tight_layout()
+
+
+def print_eedf_whole():
+    for pos in [0,2,4,6]:
+        for press in [40,100]:
+            plt.figure(figsize=(7,4.5))
+            
+            for power in [400, 600, 800, 1000]:
+                files = []
+                template = f'/Users/marisolvelapatino/Desktop/Langmuir-Probe/LP/{pos}in/{press} mTorr/{power}W'
+                for file in os.listdir(template):
+                    final_file = template + "/" + file
+                    files.append(final_file)
+
+                if pos == 0:
+                    traces = [1,2,3,4,5]
+                else:
+                    traces = [1,2,3]
+                    
+                bundle = am.aggregate_three_traces(
+                    traces,
+                    files=files,
+                    A_probe_m2=A_probe,
+                    smooth_span_V=5.0,     # ~5 V SG window (tune 2–8 V)
+                    polyorder=3,
+                    Ndatapoints=923
+                )
+
+                am.plot_eedf_bundle(bundle, title=f"{power} W")
+        
+            plt.title(f"{pos} in, {press} mTorr")
+            plt.show()

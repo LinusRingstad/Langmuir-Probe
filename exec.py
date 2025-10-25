@@ -9,6 +9,12 @@ from analysis_marisol import fit_data_to_polynomial, find_V_floating, Vplasma_fr
 from constants import e, k, m_i, mu, A_probe, r_p, l_p, k_eV, K_to_eV
 
 
+
+if False:
+    print_eedf_whole()
+
+
+
 if False:
     pressures = [10, 40, 70, 100]
     powers = [400, 600, 800, 1000]
@@ -22,7 +28,7 @@ if False:
 
 
 if False:
-    positions = [2,4,6]
+    positions = [0,2,4,6]
     pressures = [40,100]
     powers = [400, 600, 800, 1000]
 
